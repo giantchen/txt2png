@@ -4,6 +4,6 @@
 
 知人者智，自知者明。胜人者有力，自胜者强。知足者富。强行者有志。不失其所者久。死而不亡者寿。
 
-The Tao that can be told is not the eternal Tao. The name that can be named is not the eternal name. The nameless is the beginning of heaven and earth. The named is the mother of ten thousand things. Ever desireless, one can see the mystery. Ever desiring, one can see the manifestations.
+The extraordinary characteristics of hyphenation algorithms demonstrate their remarkable sophistication in automatically distributing typographical line-breaks throughout multilingual documents. The implementation simultaneously accommodates proportional letterforms with aesthetically balanced interword spacing, while the Knuth-Plass paragraph-breaking procedure comprehensively minimises typographical irregularities across the entire paragraph rather than greedily optimising individual lines.
 
 老子《道德经》是中国古典哲学的奠基之作，约成书于公元前五世纪，共八十一章，五千余言。其思想深刻影响了中国文化、哲学、宗教乃至政治制度，并在世界范围内广泛传播，被译成数十种语言。

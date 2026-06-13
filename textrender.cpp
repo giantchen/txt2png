@@ -245,6 +245,7 @@ int main(int argc, char* argv[]) {
     double tolerance = 200.0;
     bool        hyphen_on        = false;
     std::string hyphen_dict_path;
+    bool        tracing_paras   = false;
     std::string input_path, output_path;
 
     // Parse arguments
@@ -262,8 +263,9 @@ int main(int argc, char* argv[]) {
         else if (a == "--margin")    margin    = std::stoi(need("--margin"));
         else if (a == "--leading")   leading   = std::stod(need("--leading"));
         else if (a == "--tolerance")  tolerance = std::stod(need("--tolerance"));
-        else if (a == "--hyphen")      hyphen_on = true;
-        else if (a == "--hyphen-dict") { hyphen_dict_path = need("--hyphen-dict"); hyphen_on = true; }
+        else if (a == "--hyphen")            hyphen_on = true;
+        else if (a == "--hyphen-dict")       { hyphen_dict_path = need("--hyphen-dict"); hyphen_on = true; }
+        else if (a == "--tracingparagraphs") tracing_paras = true;
         else if (input_path.empty()) input_path  = a;
         else if (output_path.empty()) output_path = a;
         else { std::cerr << "Unknown argument: " << a << '\n'; return 1; }
@@ -280,8 +282,9 @@ int main(int argc, char* argv[]) {
             "  --margin N         margin in pixels (default: 72)\n"
             "  --leading N        line-height multiplier (default: 1.4)\n"
             "  --tolerance N      Knuth-Plass tolerance (default: 200)\n"
-            "  --hyphen           enable English hyphenation (hyph_en_US.dic)\n"
-            "  --hyphen-dict PATH use a custom hyphenation dictionary\n";
+            "  --hyphen              enable English hyphenation (hyph_en_US.dic)\n"
+            "  --hyphen-dict PATH    use a custom hyphenation dictionary\n"
+            "  --tracingparagraphs   print Knuth-Plass diagnostics to stderr\n";
         return 1;
     }
 
@@ -307,10 +310,12 @@ int main(int argc, char* argv[]) {
     // HarfBuzz font (borrows ft_face, reference-counted)
     hb_font_t* hb_font = hb_ft_font_create(ft_face, nullptr);
 
-    // Measure space
+    // Inter-word spacing.  Use em-based stretch/shrink (TeX §1086 style) rather
+    // than the space glyph advance, because CJK fonts often have very narrow
+    // space glyphs that produce absurdly high badness on Latin text.
     const double space_w  = hb_advance_px(hb_font, " ");
-    const double space_s  = space_w * 0.5;
-    const double space_k  = space_w * 0.333;
+    const double space_s  = pt_size / 3.0;   // 1/3 em stretch
+    const double space_k  = pt_size / 9.0;   // 1/9 em shrink
 
     const double text_w   = page_w - 2.0 * margin;
     const double line_h   = pt_size * leading;
@@ -328,7 +333,8 @@ int main(int argc, char* argv[]) {
 
     // Knuth-Plass params
     Params kp_params;
-    kp_params.tolerance = tolerance;
+    kp_params.tolerance        = tolerance;
+    kp_params.emergency_stretch = space_s;   // last-resort stretch = 1/3 em
 
     // Cairo surface
     cairo_surface_t* surface =
@@ -349,6 +355,7 @@ int main(int argc, char* argv[]) {
     // Baseline y starts at top margin + ascender
     double baseline_y = margin + pt_size;  // rough first baseline
 
+    std::ostream* trace_out = tracing_paras ? &std::cerr : nullptr;
     auto paras = split_paragraphs(text);
 
     for (size_t pi = 0; pi < paras.size(); ++pi) {
@@ -358,10 +365,13 @@ int main(int argc, char* argv[]) {
         auto items = build_para_items(hb_font, para, space_w, space_s, space_k, hyph_dict);
         if (items.size() <= 2) continue;  // empty paragraph (only sentinel items)
 
+        if (trace_out)
+            *trace_out << "\n[paragraph " << (pi + 1) << "]\n";
+
         LineSpec spec = LineSpec::uniform(text_w);
         std::vector<int> breaks;
         try {
-            breaks = break_paragraph(items, spec, kp_params);
+            breaks = break_paragraph(items, spec, kp_params, trace_out);
         } catch (const std::exception& e) {
             std::cerr << "Warning: " << e.what() << " — using greedy fallback\n";
             // Greedy fallback: just collect all break-eligible positions

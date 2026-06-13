@@ -61,8 +61,9 @@ Options:
   --margin N         margin in pixels on all sides (default: 72)
   --leading N        line-height multiplier (default: 1.4)
   --tolerance N      Knuth-Plass badness tolerance (default: 200)
-  --hyphen           enable English hyphenation (uses hyph_en_US.dic)
-  --hyphen-dict PATH use a custom libhyphen dictionary file
+  --hyphen              enable English hyphenation (uses hyph_en_US.dic)
+  --hyphen-dict PATH    use a custom libhyphen dictionary file
+  --tracingparagraphs   print Knuth-Plass diagnostics to stderr (like TeX \tracingparagraphs=1)
 ```
 
 ```bash
@@ -81,4 +82,8 @@ Options:
 - **libhyphen word hyphenation** — TeX-pattern hyphenation for English
   (enabled with `--hyphen`); consecutive hyphenated lines are penalised via
   Knuth-Plass `double_hyphen_demerits`.
+- **`--tracingparagraphs` diagnostics** — mirrors TeX's `\tracingparagraphs=1`,
+  printing to stderr: pass header (`@firstpass`/`@secondpass`/`@thirdpass`),
+  per-candidate lines (`@\glue via @@N b=B p=P d=D`), per-registered-node
+  lines (`@@N: line L.F[−] t=T -> @@M`), and total demerits per paragraph.
 - **Cairo PNG rendering** — anti-aliased vector rasterisation via FreeType.

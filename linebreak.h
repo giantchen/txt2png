@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -84,6 +85,7 @@ struct Active {
     bool   flagged;
     double demerits;
     double tw, ts, tk;
+    int    serial = 0;          // tracing: serial number (@@N in TeX output)
     std::shared_ptr<Active> prev;
 };
 
@@ -102,6 +104,8 @@ inline double badness(double t, double s) {
 
 // ---------------------------------------------------------------------------
 // Single pass of the Knuth-Plass algorithm.
+//
+// trace_out: if non-null, emit \tracingparagraphs-style diagnostics.
 // ---------------------------------------------------------------------------
 
 inline std::vector<ActivePtr> linebreak_pass(
@@ -109,12 +113,16 @@ inline std::vector<ActivePtr> linebreak_pass(
     const LineSpec&           spec,
     const Params&             params,
     double                    tolerance,
-    double                    extra_stretch)
+    double                    extra_stretch,
+    std::ostream*             trace_out = nullptr)
 {
+    // seed node: serial 0 (@@0 = paragraph start)
     auto seed = std::make_shared<Active>(Active{
-        -1, 0, DECENT, false, 0.0, 0.0, 0.0, 0.0, nullptr
+        -1, 0, DECENT, false, 0.0, 0.0, 0.0, 0.0, 0, nullptr
     });
     std::vector<ActivePtr> active{seed};
+
+    int serial_ctr = 1;  // next serial to assign; 0 is the seed
 
     double cum_w = 0.0, cum_s = 0.0, cum_k = 0.0;
     const int n = static_cast<int>(items.size());
@@ -141,6 +149,9 @@ inline std::vector<ActivePtr> linebreak_pass(
         if (is_break) {
             const double bw = cum_w, bs = cum_s, bk = cum_k;
             if (pi <= -INF_PENALTY) pi = -INF_PENALTY;
+
+            const char* itype = std::holds_alternative<Glue>(item)
+                ? "\\glue" : "\\penalty";
 
             std::vector<ActivePtr> survivors;
             std::vector<ActivePtr> new_nodes;
@@ -170,12 +181,12 @@ inline std::vector<ActivePtr> linebreak_pass(
 
                 const bool overfull = (sfall < 0.0);
                 if (overfull && b > tolerance && pi != -INF_PENALTY)
-                    continue;
+                    continue;  // deactivated — don't trace
 
                 survivors.push_back(a);
 
                 if (b > tolerance && !overfull && pi != -INF_PENALTY)
-                    continue;
+                    continue;  // underfull skip — still trace the candidate
 
                 double d = 0.0;
                 if (pi != -INF_PENALTY && b < INF_BAD) {
@@ -186,6 +197,20 @@ inline std::vector<ActivePtr> linebreak_pass(
                     if (std::abs(fc - a->fit) > 1) d += params.adj_demerits;
                 }
                 d += a->demerits;
+
+                // Tracing: @\glue via @@N b=B p=P d=D
+                if (trace_out) {
+                    *trace_out << "@" << itype
+                               << " via @@" << a->serial
+                               << " b=" << static_cast<long long>(b)
+                               << " p=" << static_cast<long long>(pi)
+                               << " d=";
+                    if (pi <= -INF_PENALTY || b >= INF_BAD)
+                        *trace_out << "*";
+                    else
+                        *trace_out << static_cast<long long>(d - a->demerits);
+                    *trace_out << "\n";
+                }
 
                 if (d <= min_dem[fc]) {
                     min_dem[fc]   = d;
@@ -198,11 +223,25 @@ inline std::vector<ActivePtr> linebreak_pass(
             if (global_min < AWFUL_BAD) {
                 for (int fc = 0; fc < 4; ++fc) {
                     if (min_dem[fc] <= global_min + params.adj_demerits) {
-                        new_nodes.push_back(std::make_shared<Active>(Active{
+                        auto node = std::make_shared<Active>(Active{
                             i, best_line[fc], fc, is_flag,
                             min_dem[fc], bw, bs, bk,
+                            serial_ctr,
                             best_prev[fc]
-                        }));
+                        });
+                        // Tracing: @@N: line L.F[−] t=T -> @@M
+                        if (trace_out) {
+                            int ps = best_prev[fc] ? best_prev[fc]->serial : 0;
+                            *trace_out << "@@" << serial_ctr
+                                       << ": line " << best_line[fc]
+                                       << "." << fc;
+                            if (is_flag) *trace_out << "-";
+                            *trace_out << " t="
+                                       << static_cast<long long>(min_dem[fc])
+                                       << " -> @@" << ps << "\n";
+                        }
+                        ++serial_ctr;
+                        new_nodes.push_back(std::move(node));
                     }
                 }
             }
@@ -244,23 +283,34 @@ inline std::vector<int> traceback(const ActivePtr& node) {
 
 // ---------------------------------------------------------------------------
 // Public API: break_paragraph
+//
+// trace_out: if non-null, emit TeX \tracingparagraphs-style diagnostics.
 // ---------------------------------------------------------------------------
 
 inline std::vector<int> break_paragraph(
     const std::vector<Item>& items,
     const LineSpec&           spec,
-    const Params&             params = {})
+    const Params&             params    = {},
+    std::ostream*             trace_out = nullptr)
 {
+    static const char* pass_names[3] = {
+        "@firstpass", "@secondpass", "@thirdpass"
+    };
     const double tols[3]   = {params.pre_tolerance, params.tolerance, params.tolerance};
     const double extras[3] = {0.0, 0.0, params.emergency_stretch};
 
     for (int pass = 0; pass < 3; ++pass) {
-        auto finals = linebreak_pass(items, spec, params, tols[pass], extras[pass]);
+        if (trace_out) *trace_out << pass_names[pass] << "\n";
+        auto finals = linebreak_pass(items, spec, params,
+                                     tols[pass], extras[pass], trace_out);
         if (!finals.empty()) {
             auto best = *std::min_element(finals.begin(), finals.end(),
                 [](const ActivePtr& a, const ActivePtr& b) {
                     return a->demerits < b->demerits;
                 });
+            if (trace_out)
+                *trace_out << "\ntotal demerits = "
+                           << static_cast<long long>(best->demerits) << "\n\n";
             return traceback(best);
         }
     }
