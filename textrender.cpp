@@ -7,13 +7,15 @@
 // Usage:  ./textrender [OPTIONS] INPUT.txt OUTPUT.png
 //
 // Options:
-//   --font PATH   TTF/OTF font  (default: NotoSerifCJK-Regular.ttc)
-//   --size N      font size in points  (default: 12)
-//   --width N     page width in pixels  (default: 800)
-//   --height N    page height in pixels (default: 1000)
-//   --margin N    margin in pixels on all sides (default: 72)
-//   --leading N   line-height multiplier (default: 1.4)
-//   --tolerance N Knuth-Plass tolerance (default: 200)
+//   --font PATH        TTF/OTF font  (default: NotoSerifCJK-Regular.ttc)
+//   --size N           font size in points  (default: 12)
+//   --width N          page width in pixels  (default: 800)
+//   --height N         page height in pixels (default: 1000)
+//   --margin N         margin in pixels on all sides (default: 72)
+//   --leading N        line-height multiplier (default: 1.4)
+//   --tolerance N      Knuth-Plass tolerance (default: 200)
+//   --hyphen           enable English hyphenation (libhyphen, hyph_en_US.dic)
+//   --hyphen-dict PATH use a custom hyphenation dictionary file
 
 #include "linebreak.h"
 
@@ -25,7 +27,10 @@
 #include <harfbuzz/hb.h>
 #include <unicode/brkiter.h>
 #include <unicode/unistr.h>
+#include <hyphen.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -87,6 +92,28 @@ static void shape_to_glyphs(
     hb_buffer_destroy(buf);
 }
 
+// Returns 0-based byte indices after which a hyphen may be inserted.
+// Requires word to be pure ASCII letters (libhyphen operates on lowercase).
+static std::vector<int> hyphen_breaks(HyphenDict* dict, const std::string& word) {
+    if (!dict || word.size() < 4) return {};
+    std::string lower = word;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    int n = static_cast<int>(lower.size());
+    std::vector<char> hbuf(static_cast<size_t>(n) + 5, 0);
+    char** rep = nullptr; int* pos = nullptr; int* cut = nullptr;
+    int rc = hnj_hyphen_hyphenate2(dict, lower.c_str(), n,
+                                   hbuf.data(), nullptr, &rep, &pos, &cut);
+    if (rep) { for (int i = 0; i < n; ++i) if (rep[i]) free(rep[i]); free(rep); }
+    if (pos) free(pos);
+    if (cut) free(cut);
+    if (rc != 0) return {};
+    std::vector<int> breaks;
+    for (int i = 1; i < n - 2; ++i)   // min 2 chars on each side
+        if (hbuf[i] & 1) breaks.push_back(i);
+    return breaks;
+}
+
 // Build Knuth-Plass items from a paragraph using ICU UAX #14 line break iterator.
 //
 // Each ICU break segment becomes a Box (measured via HarfBuzz).
@@ -99,7 +126,8 @@ static std::vector<Item> build_para_items(
     const std::string& para,
     double             space_w,
     double             space_s,
-    double             space_k)
+    double             space_k,
+    HyphenDict*        hyph_dict = nullptr)
 {
     icu::UnicodeString ustr = icu::UnicodeString::fromUTF8(para);
 
@@ -134,19 +162,38 @@ static std::vector<Item> build_para_items(
         ustr.tempSubStringBetween(prev, trail).toUTF8String(word_utf8);
 
         if (!word_utf8.empty()) {
-            double w = hb_advance_px(hb_font, word_utf8);
-            items.push_back(Box{w, word_utf8});
-
-            if (has_space) {
-                // Latin inter-word space
+            if (has_space && hyph_dict) {
+                // Latin word: try to hyphenate
+                auto hbreaks = hyphen_breaks(hyph_dict, word_utf8);
+                if (!hbreaks.empty()) {
+                    int prev_pos = 0;
+                    for (int bp : hbreaks) {
+                        std::string syl = word_utf8.substr(
+                            static_cast<size_t>(prev_pos),
+                            static_cast<size_t>(bp + 1 - prev_pos));
+                        items.push_back(Box{hb_advance_px(hb_font, syl), syl});
+                        items.push_back(Penalty{50.0, true});  // flagged = hyphen point
+                        prev_pos = bp + 1;
+                    }
+                    std::string last = word_utf8.substr(static_cast<size_t>(prev_pos));
+                    items.push_back(Box{hb_advance_px(hb_font, last), last});
+                } else {
+                    items.push_back(Box{hb_advance_px(hb_font, word_utf8), word_utf8});
+                }
+                items.push_back(Glue{space_w, space_s, space_k});
+            } else if (has_space) {
+                // Latin inter-word space (no hyphenation)
+                items.push_back(Box{hb_advance_px(hb_font, word_utf8), word_utf8});
                 items.push_back(Glue{space_w, space_s, space_k});
             } else {
-                // No trailing space: check if mandatory break (hard line break)
+                // No trailing space: CJK inter-char or end of paragraph
+                double w = hb_advance_px(hb_font, word_utf8);
+                items.push_back(Box{w, word_utf8});
                 int rule = bi->getRuleStatus();
                 if (rule >= UBRK_LINE_HARD) {
                     items.push_back(Penalty{-INF_PENALTY, false});
                 } else {
-                    // Optional break (CJK inter-char): micro-glue for justification
+                    // Optional break: micro-glue so Knuth-Plass can justify CJK
                     items.push_back(Glue{0.0, cjk_stretch, 0.0});
                 }
             }
@@ -196,6 +243,8 @@ int main(int argc, char* argv[]) {
     int    margin    = 72;
     double leading   = 1.4;
     double tolerance = 200.0;
+    bool        hyphen_on        = false;
+    std::string hyphen_dict_path;
     std::string input_path, output_path;
 
     // Parse arguments
@@ -212,7 +261,9 @@ int main(int argc, char* argv[]) {
         else if (a == "--height")    page_h    = std::stoi(need("--height"));
         else if (a == "--margin")    margin    = std::stoi(need("--margin"));
         else if (a == "--leading")   leading   = std::stod(need("--leading"));
-        else if (a == "--tolerance") tolerance = std::stod(need("--tolerance"));
+        else if (a == "--tolerance")  tolerance = std::stod(need("--tolerance"));
+        else if (a == "--hyphen")      hyphen_on = true;
+        else if (a == "--hyphen-dict") { hyphen_dict_path = need("--hyphen-dict"); hyphen_on = true; }
         else if (input_path.empty()) input_path  = a;
         else if (output_path.empty()) output_path = a;
         else { std::cerr << "Unknown argument: " << a << '\n'; return 1; }
@@ -222,13 +273,15 @@ int main(int argc, char* argv[]) {
         std::cerr <<
             "Usage: textrender [OPTIONS] INPUT.txt OUTPUT.png\n"
             "Options:\n"
-            "  --font PATH      font file (default: DejaVuSerif.ttf)\n"
-            "  --size N         font size in points (default: 12)\n"
-            "  --width N        page width in pixels (default: 800)\n"
-            "  --height N       page height in pixels (default: 1000)\n"
-            "  --margin N       margin in pixels (default: 72)\n"
-            "  --leading N      line-height multiplier (default: 1.4)\n"
-            "  --tolerance N    Knuth-Plass tolerance (default: 200)\n";
+            "  --font PATH        font file (default: NotoSerifCJK-Regular.ttc)\n"
+            "  --size N           font size in points (default: 12)\n"
+            "  --width N          page width in pixels (default: 800)\n"
+            "  --height N         page height in pixels (default: 1000)\n"
+            "  --margin N         margin in pixels (default: 72)\n"
+            "  --leading N        line-height multiplier (default: 1.4)\n"
+            "  --tolerance N      Knuth-Plass tolerance (default: 200)\n"
+            "  --hyphen           enable English hyphenation (hyph_en_US.dic)\n"
+            "  --hyphen-dict PATH use a custom hyphenation dictionary\n";
         return 1;
     }
 
@@ -262,6 +315,17 @@ int main(int argc, char* argv[]) {
     const double text_w   = page_w - 2.0 * margin;
     const double line_h   = pt_size * leading;
 
+    // Hyphenation dictionary
+    HyphenDict* hyph_dict = nullptr;
+    if (hyphen_on) {
+        if (hyphen_dict_path.empty())
+            hyphen_dict_path = "/usr/share/hyphen/hyph_en_US.dic";
+        hyph_dict = hnj_hyphen_load(hyphen_dict_path.c_str());
+        if (!hyph_dict)
+            std::cerr << "Warning: cannot load hyphen dict: "
+                      << hyphen_dict_path << '\n';
+    }
+
     // Knuth-Plass params
     Params kp_params;
     kp_params.tolerance = tolerance;
@@ -291,7 +355,7 @@ int main(int argc, char* argv[]) {
         const std::string& para = paras[pi];
 
         // Build items using ICU Unicode Line Breaking Algorithm (UAX #14)
-        auto items = build_para_items(hb_font, para, space_w, space_s, space_k);
+        auto items = build_para_items(hb_font, para, space_w, space_s, space_k, hyph_dict);
         if (items.size() <= 2) continue;  // empty paragraph (only sentinel items)
 
         LineSpec spec = LineSpec::uniform(text_w);
@@ -333,8 +397,18 @@ int main(int argc, char* argv[]) {
             if (seg_start >= seg_end) continue;
             if (baseline_y > page_h - margin) break;  // out of page
 
+            // Check if this line ends at a hyphen break
+            bool   line_ends_hyphen = false;
+            double hyphen_w         = 0.0;
+            if (seg_end < static_cast<int>(items.size()))
+                if (auto* pen = std::get_if<Penalty>(&items[seg_end]))
+                    if (pen->flagged) {
+                        line_ends_hyphen = true;
+                        hyphen_w = hb_advance_px(hb_font, "-");
+                    }
+
             // Measure natural width + stretch + shrink for this line
-            double nat = 0.0, stretch = 0.0, shrink = 0.0;
+            double nat = hyphen_w, stretch = 0.0, shrink = 0.0;
             for (int idx = seg_start; idx < seg_end; ++idx) {
                 const Item& it = items[idx];
                 if (auto* b = std::get_if<Box>(&it))       nat += b->width;
@@ -364,8 +438,9 @@ int main(int argc, char* argv[]) {
                         : g->width + ratio * g->shrink;
                     pen_x += w;
                 }
-                // Penalty glyphs (hyphen) omitted for now
             }
+            if (line_ends_hyphen)
+                shape_to_glyphs(hb_font, "-", pen_x, baseline_y, glyphs);
 
             if (!glyphs.empty())
                 cairo_show_glyphs(cr, glyphs.data(),
@@ -388,6 +463,7 @@ int main(int argc, char* argv[]) {
     }
     cairo_surface_destroy(surface);
 
+    if (hyph_dict) hnj_hyphen_free(hyph_dict);
     hb_font_destroy(hb_font);
     FT_Done_Face(ft_face);
     FT_Done_FreeType(ft_lib);

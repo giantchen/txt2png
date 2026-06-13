@@ -3,7 +3,7 @@ CXXFLAGS = -std=c++17 -O2 $(shell pkg-config --cflags harfbuzz cairo freetype2)
 LIBS     = $(shell pkg-config --libs harfbuzz cairo freetype2)
 
 TR_CXXFLAGS = $(CXXFLAGS) $(shell pkg-config --cflags icu-uc icu-i18n)
-TR_LIBS     = $(LIBS) $(shell pkg-config --libs icu-uc icu-i18n)
+TR_LIBS     = $(LIBS) $(shell pkg-config --libs icu-uc icu-i18n) -lhyphen
 
 .PHONY: all clean
 
