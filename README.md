@@ -2,10 +2,12 @@
 
 ## tex — Knuth-Plass line-breaking & text-to-PNG renderer
 
-Tools in the `tex/` directory implement the Knuth-Plass optimal line-breaking
-algorithm and a CLI renderer that produces PNG images from plain-text files.
+Tools implement the Knuth-Plass optimal line-breaking algorithm and a CLI
+renderer that produces PNG images from plain-text files, in both C++ and Python.
 
 ### Dependencies
+
+#### C++
 
 Install build tools and runtime libraries (Ubuntu/Debian):
 
@@ -21,10 +23,15 @@ sudo apt-get install -y \
     hyphen-en-us
 ```
 
-### Build
+#### Python
 
 ```bash
-cd tex
+pip install uharfbuzz pycairo freetype-py pyphen
+```
+
+### Build (C++)
+
+```bash
 make
 ```
 
@@ -47,7 +54,7 @@ This produces two binaries:
 ./linebreak_cpp "In olden times when wishing still helped one..." 72
 ```
 
-#### textrender
+#### textrender (C++)
 
 ```
 ./textrender [OPTIONS] INPUT.txt OUTPUT.png
@@ -70,6 +77,14 @@ Options:
 # Render Chinese + English text (hyphenation on by default)
 ./textrender --size 14 --width 800 --height 1000 sample_cjk.txt out.png
 ```
+
+#### textrender (Python)
+
+```bash
+python3 textrender.py --size 14 --width 800 --height 1000 sample_cjk.txt out.png
+```
+
+The Python renderer accepts the same options as the C++ version.
 
 ### Features
 
