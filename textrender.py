@@ -9,6 +9,7 @@ Python port of textrender.cpp using the same underlying C libraries:
   freetype-py    — FreeType font loading
   pycairo        — Cairo PNG rendering
   pyphen         — English word hyphenation
+  uniseg         — UAX #14 Unicode line-break segmentation
 """
 
 import sys
@@ -21,6 +22,7 @@ import uharfbuzz as hb
 import cairo
 import freetype
 import pyphen
+from uniseg.linebreak import line_break_units
 
 sys.path.insert(0, str(Path(__file__).parent))
 from linebreak import Box, Glue, Penalty, Params, LineSpec, break_paragraph, INF_PENALTY
@@ -152,38 +154,21 @@ def _hyphen_breaks(dic, word: str):
     return [p - 1 for p in dic.positions(word.lower()) if 2 <= p <= n - 2]
 
 # ---------------------------------------------------------------------------
-# Paragraph segmentation (approximates ICU UAX #14)
+# Paragraph segmentation (UAX #14 via uniseg)
 # ---------------------------------------------------------------------------
 
 def _segment_paragraph(text: str):
     """
-    Yield (word, has_trailing_space) tuples.
-    CJK characters each become a single-char segment (has_trailing_space=False).
-    Latin words end when a space or CJK boundary is hit; has_trailing_space
-    reflects whether an ASCII space followed the word (and was consumed).
+    Yield (word, has_trailing_space) tuples using UAX #14 line-break units
+    (uniseg.linebreak.line_break_units).  Each chunk from uniseg is stripped of
+    its trailing space; has_trailing_space is True when a space was present.
     """
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == " ":
-            i += 1
+    for chunk in line_break_units(text):
+        word = chunk.rstrip(" ")
+        if not word:
             continue
-        cp = ord(ch)
-        if _is_cjk_segmentation(cp):
-            yield ch, False
-            i += 1
-        else:
-            j = i
-            while j < n and text[j] != " " and not _is_cjk_segmentation(ord(text[j])):
-                j += 1
-            word = text[i:j]
-            if not word:
-                i += 1
-                continue
-            has_space = (j < n and text[j] == " ")
-            i = j + 1 if has_space else j
-            yield word, has_space
+        has_space = len(word) < len(chunk)
+        yield word, has_space
 
 # ---------------------------------------------------------------------------
 # Build Knuth-Plass item list from a paragraph
