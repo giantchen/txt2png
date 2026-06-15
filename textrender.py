@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 textrender.py — render a plain-text file to PNG.
 

@@ -26,7 +26,7 @@ sudo apt-get install -y \
 #### Python
 
 ```bash
-pip install uharfbuzz pycairo freetype-py pyphen
+pip install uharfbuzz pycairo freetype-py pyphen uniseg
 ```
 
 ### Build (C++)

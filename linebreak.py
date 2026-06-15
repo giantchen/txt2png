@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Knuth-Plass optimal line-breaking algorithm.
 
