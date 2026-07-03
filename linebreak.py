@@ -116,6 +116,7 @@ class _Active:
     tw: float = 0.0   # total natural width
     ts: float = 0.0   # total stretch
     tk: float = 0.0   # total shrink
+    prev: Optional[_Active] = None
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,115 @@ def _badness(t: float, s: float) -> float:
 # The main algorithm
 # ---------------------------------------------------------------------------
 
+def _try_break(
+    active: List[_Active],
+    pos: int,
+    pi: float,
+    is_flag: bool,
+    bw: float,
+    bs: float,
+    bk: float,
+    spec: LineSpec,
+    params: Params,
+    tolerance: float,
+    extra_stretch: float,
+) -> List[_Active]:
+    """
+    For each active node, consider breaking at the current position (pos).
+    Mirrors procedure trybreak in tex.p §829.
+    """
+    if pi <= -INF_PENALTY:
+        pi = float(-INF_PENALTY)    # clamp forced break
+
+    new_active: List[_Active] = []
+    survivors:  List[_Active] = []
+
+    min_dem    = [AWFUL_BAD] * 4
+    best_prev: List[Optional[_Active]] = [None] * 4
+    best_line  = [0] * 4
+    global_min = AWFUL_BAD
+
+    for a in active:
+        # Width of candidate line from a.pos to here
+        line_w = bw - a.tw
+        line_s = bs - a.ts + extra_stretch
+        line_k = bk - a.tk
+
+        line_num = a.line + 1
+        target   = spec.width(line_num)
+        shortfall = target - line_w
+
+        # Classify and compute badness (§851-853)
+        if shortfall > 0:
+            b = _badness(shortfall, line_s)
+            if   b > 99: fc = VERY_LOOSE
+            elif b > 12: fc = LOOSE
+            else:        fc = DECENT
+        elif shortfall < 0:
+            b  = _badness(-shortfall, line_k)
+            fc = TIGHT if b > 12 else DECENT
+        else:
+            b  = 0.0
+            fc = DECENT
+
+        # Deactivation rule (§854 in tex.p):
+        # - Overfull lines (shortfall < 0, line already too long):
+        #   deactivate if b > tolerance — future items only add width.
+        # - Underfull lines (shortfall >= 0): KEEP the node active
+        #   even if b > tolerance — future items may fill the line.
+        # - Forced break (pi = -INF_PENALTY): never deactivate.
+        overfull = (shortfall < 0)
+        if overfull and b > tolerance and pi != -INF_PENALTY:
+            continue   # line already too long; discard this node
+        survivors.append(a)
+
+        # Skip recording this as a break if underfull and too bad
+        if b > tolerance and not overfull and pi != -INF_PENALTY:
+            continue
+
+        # Demerits (§855, §859)
+        if pi == -INF_PENALTY or b >= INF_BAD:
+            d = 0.0    # artificial: forced or desperate break
+        else:
+            d = (params.line_penalty + b) ** 2
+            if pi > 0:
+                d += pi * pi
+            elif pi > -INF_PENALTY:
+                d -= pi * pi
+            if is_flag and a.flagged:
+                d += params.double_hyphen_demerits
+            if abs(fc - a.fit) > 1:
+                d += params.adj_demerits
+
+        d += a.demerits
+
+        if d <= min_dem[fc]:
+            min_dem[fc]   = d
+            best_prev[fc] = a
+            best_line[fc] = line_num
+            if d < global_min:
+                global_min = d
+
+    # Create new active nodes for the best break in each fit class (§845)
+    if global_min < AWFUL_BAD:
+        for fc in range(4):
+            if min_dem[fc] <= global_min + params.adj_demerits:
+                node = _Active(
+                    pos      = pos,
+                    line     = best_line[fc],
+                    fit      = fc,
+                    flagged  = is_flag,
+                    demerits = min_dem[fc],
+                    tw = bw,
+                    ts = bs,
+                    tk = bk,
+                    prev = best_prev[fc],
+                )
+                new_active.append(node)
+
+    return survivors + new_active
+
+
 def _linebreak(
     items: list,
     spec: LineSpec,
@@ -153,14 +263,9 @@ def _linebreak(
     The passive chain is encoded directly in the _Active objects:
     we store a `prev` pointer to enable traceback.
     """
-    # We augment _Active with a prev pointer for traceback.
-    # Using a parallel list instead of modifying the frozen dataclass.
-    prev_of: dict[int, Optional[_Active]] = {}   # id(node) -> predecessor node
-
     # Seed the active list: one node representing the start of the paragraph.
-    seed = _Active(pos=-1, line=0, fit=DECENT, flagged=False, demerits=0)
+    seed = _Active(pos=-1, line=0, fit=DECENT, flagged=False, demerits=0, prev=None)
     active: List[_Active] = [seed]
-    prev_of[id(seed)] = None
 
     # Running sums of natural width / stretch / shrink from start of paragraph
     # to the position just *before* the current item (updated as we scan).
@@ -198,106 +303,10 @@ def _linebreak(
         # For a penalty break, the penalty itself has no width.
         # -----------------------------------------------------------------
         if is_break:
-            if isinstance(item, Glue):
-                bw, bs, bk = cum_w, cum_s, cum_k
-                # glue is discarded; cum_* will be updated below after try_break
-            else:
-                bw, bs, bk = cum_w, cum_s, cum_k
-
-            # -------------------------------------------------------------
-            # try_break: for each active node, consider breaking here.
-            # Mirrors procedure trybreak in tex.p §829.
-            # -------------------------------------------------------------
-            if pi <= -INF_PENALTY:
-                pi = float(-INF_PENALTY)    # clamp forced break
-
-            new_active: List[_Active] = []
-            survivors:  List[_Active] = []
-
-            min_dem    = [AWFUL_BAD] * 4
-            best_prev  = [None]      * 4
-            best_line  = [0]         * 4
-            global_min = AWFUL_BAD
-
-            for a in active:
-                # Width of candidate line from a.pos to here
-                line_w = bw - a.tw + extra_stretch
-                line_s = bs - a.ts + extra_stretch
-                line_k = bk - a.tk
-
-                line_num = a.line + 1
-                target   = spec.width(line_num)
-                shortfall = target - line_w
-
-                # Classify and compute badness (§851-853)
-                if shortfall > 0:
-                    b = _badness(shortfall, line_s)
-                    if   b > 99: fc = VERY_LOOSE
-                    elif b > 12: fc = LOOSE
-                    else:        fc = DECENT
-                elif shortfall < 0:
-                    b  = _badness(-shortfall, line_k)
-                    fc = TIGHT if b > 12 else DECENT
-                else:
-                    b  = 0.0
-                    fc = DECENT
-
-                # Deactivation rule (§854 in tex.p):
-                # - Overfull lines (shortfall < 0, line already too long):
-                #   deactivate if b > tolerance — future items only add width.
-                # - Underfull lines (shortfall >= 0): KEEP the node active
-                #   even if b > tolerance — future items may fill the line.
-                # - Forced break (pi = -INF_PENALTY): never deactivate.
-                overfull = (shortfall < 0)
-                if overfull and b > tolerance and pi != -INF_PENALTY:
-                    continue   # line already too long; discard this node
-                survivors.append(a)
-
-                # Skip recording this as a break if underfull and too bad
-                if b > tolerance and not overfull and pi != -INF_PENALTY:
-                    continue
-
-                # Demerits (§855, §859)
-                if pi == -INF_PENALTY or b >= INF_BAD:
-                    d = 0.0    # artificial: forced or desperate break
-                else:
-                    d = (params.line_penalty + b) ** 2
-                    if pi > 0:
-                        d += pi * pi
-                    elif pi > -INF_PENALTY:
-                        d -= pi * pi
-                    if is_flag and a.flagged:
-                        d += params.double_hyphen_demerits
-                    if abs(fc - a.fit) > 1:
-                        d += params.adj_demerits
-
-                d += a.demerits
-
-                if d <= min_dem[fc]:
-                    min_dem[fc]   = d
-                    best_prev[fc] = a
-                    best_line[fc] = line_num
-                    if d < global_min:
-                        global_min = d
-
-            # Create new active nodes for the best break in each fit class (§845)
-            if global_min < AWFUL_BAD:
-                for fc in range(4):
-                    if min_dem[fc] <= global_min + params.adj_demerits:
-                        node = _Active(
-                            pos      = i,
-                            line     = best_line[fc],
-                            fit      = fc,
-                            flagged  = is_flag,
-                            demerits = min_dem[fc],
-                            tw = bw,
-                            ts = bs,
-                            tk = bk,
-                        )
-                        new_active.append(node)
-                        prev_of[id(node)] = best_prev[fc]
-
-            active = survivors + new_active
+            active = _try_break(
+                active, i, pi, is_flag, cum_w, cum_s, cum_k,
+                spec, params, tolerance, extra_stretch
+            )
 
         # -----------------------------------------------------------------
         # Update running sums (AFTER try_break, matching TeX's scan order)
@@ -333,22 +342,17 @@ def _linebreak(
     if not final_nodes:
         return None
 
-    # Attach the shared prev_of dict for traceback
-    for n in final_nodes:
-        n._prev_of = prev_of   # type: ignore[attr-defined]
-
     return final_nodes
 
 
 def _traceback(final_node: _Active) -> List[int]:
     """Follow prev pointers from final_node back to the seed, collect break positions."""
-    prev_of = final_node._prev_of   # type: ignore[attr-defined]
     breaks  = []
-    cur     = final_node
+    cur: Optional[_Active] = final_node
     while cur is not None:
         if cur.pos >= 0:
             breaks.append(cur.pos)
-        cur = prev_of.get(id(cur))
+        cur = cur.prev
     breaks.reverse()
     return breaks
 
@@ -386,6 +390,7 @@ def break_paragraph(
     for tolerance, extra in passes:
         result = _linebreak(items, spec, params, tolerance, extra)
         if result:
+            print(f'tolerance {tolerance} emergency_stretch {extra} got {len(result)}.')
             # Pick the node with lowest total demerits
             best = min(result, key=lambda n: n.demerits)
             return _traceback(best)

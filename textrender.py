@@ -102,9 +102,8 @@ def _is_latin_or_digit(cp: int) -> bool:
 # HarfBuzz helpers
 # ---------------------------------------------------------------------------
 
-def _hb_advance_px(font: hb.Font, text: str, ft_face=None) -> float:
-    """Measure shaped advance in pixels.
-    """
+def _hb_advance_px(font: hb.Font, text: str) -> float:
+    """Measure shaped advance in pixels."""
     buf = hb.Buffer()
     buf.add_str(text)
     buf.guess_segment_properties()
@@ -112,9 +111,8 @@ def _hb_advance_px(font: hb.Font, text: str, ft_face=None) -> float:
     return sum(p.x_advance for p in buf.glyph_positions) / 64.0
 
 
-def _shape_to_glyphs(font: hb.Font, text: str, pen_x: float, pen_y: float,
-                     ft_face=None):
-    """Return ([(glyph_id, x, y), ...], new_pen_x).
+def _shape_to_glyphs(font: hb.Font, text: str, pen_x: float, pen_y: float):
+    """Return [(glyph_id, x, y), ...].
     Always uses HarfBuzz x_advance for pen advancement (includes GPOS kerning).
     """
     buf = hb.Buffer()
@@ -129,7 +127,7 @@ def _shape_to_glyphs(font: hb.Font, text: str, pen_x: float, pen_y: float,
                        y - pos.y_offset / 64.0))
         x += pos.x_advance / 64.0
         y -= pos.y_advance / 64.0
-    return glyphs, x
+    return glyphs
 
 # ---------------------------------------------------------------------------
 # Hyphenation (pyphen)
@@ -165,7 +163,7 @@ def _segment_paragraph(text: str):
 # ---------------------------------------------------------------------------
 
 def _build_para_items(hb_font, para: str, space_w: float, space_s: float,
-                      space_k: float, pt_size: float, dic, ft_face=None) -> list:
+                      space_k: float, pt_size: float, dic) -> list:
     cjk_stretch = space_w * 0.5
     autospace   = pt_size * 0.25
     autospace_s = pt_size * 0.05
@@ -205,19 +203,19 @@ def _build_para_items(hb_font, para: str, space_w: float, space_s: float,
                     prev = 0
                     for bp in hbreaks:
                         syl = word[prev:bp + 1]
-                        items.append(Box(_hb_advance_px(hb_font, syl, ft_face), syl))
+                        items.append(Box(_hb_advance_px(hb_font, syl), syl))
                         items.append(Penalty(50.0, True))
                         prev = bp + 1
                     last_syl = word[prev:]
                     items.append(Box(_hb_advance_px(hb_font, last_syl), last_syl))
                 else:
-                    items.append(Box(_hb_advance_px(hb_font, word, ft_face), word))
+                    items.append(Box(_hb_advance_px(hb_font, word), word))
             else:
-                items.append(Box(_hb_advance_px(hb_font, word, ft_face), word))
+                items.append(Box(_hb_advance_px(hb_font, word), word))
             items.append(Glue(space_w, space_s, space_k))
         else:
             # CJK char or last Latin word (no trailing space).
-            w = _hb_advance_px(hb_font, word, ft_face)
+            w = _hb_advance_px(hb_font, word)
             items.append(Box(w, word))
             if _is_cjk_segmentation(cp):
                 items.append(Glue(0.0, cjk_stretch, 0.0))
@@ -246,6 +244,214 @@ def _split_paragraphs(text: str):
         paras.append(" ".join(cur))
     return paras
 
+def _first_fit(items: list, text_w: float, hyphen_w: float = 0.0) -> list[int]:
+    """Simple first-fit line breaking."""
+    breaks = []
+    acc = 0.0
+    last_break_opportunity = -1
+    
+    i = 0
+    n = len(items)
+    while i < n:
+        it = items[i]
+        if isinstance(it, Box):
+            acc += it.width
+            i += 1
+        elif isinstance(it, Glue):
+            if acc + it.width > text_w:
+                if last_break_opportunity != -1:
+                    breaks.append(last_break_opportunity)
+                    i = last_break_opportunity + 1
+                    while i < n and isinstance(items[i], Glue):
+                        i += 1
+                    acc = 0.0
+                    last_break_opportunity = -1
+                else:
+                    breaks.append(i)
+                    i += 1
+                    acc = 0.0
+                    last_break_opportunity = -1
+            else:
+                acc += it.width
+                last_break_opportunity = i
+                i += 1
+        elif isinstance(it, Penalty):
+            if it.value <= -INF_PENALTY:
+                if acc > text_w and last_break_opportunity != -1:
+                    breaks.append(last_break_opportunity)
+                    i = last_break_opportunity + 1
+                    while i < n and isinstance(items[i], Glue):
+                        i += 1
+                    acc = 0.0
+                    last_break_opportunity = -1
+                else:
+                    breaks.append(i)
+                    i += 1
+                    acc = 0.0
+                    last_break_opportunity = -1
+            elif it.value < INF_PENALTY:
+                extra_w = hyphen_w if it.flagged else 0.0
+                if acc + extra_w > text_w:
+                    if last_break_opportunity != -1:
+                        breaks.append(last_break_opportunity)
+                        i = last_break_opportunity + 1
+                        while i < n and isinstance(items[i], Glue):
+                            i += 1
+                        acc = 0.0
+                        last_break_opportunity = -1
+                    else:
+                        breaks.append(i)
+                        i += 1
+                        acc = 0.0
+                        last_break_opportunity = -1
+                else:
+                    last_break_opportunity = i
+                    i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+            
+    if items and (not breaks or breaks[-1] != n - 1):
+        breaks.append(n - 1)
+        
+    return breaks
+
+
+def render_to_io(text, font_path, pt_size, page_w, margin=10, leading=1.4, tolerance=200.0, hyphen_on=True, fg=(0.0, 0.0, 0.0), bg=(1.0, 1.0, 1.0), font_index=0, justification=True):
+    import io
+    
+    # --- FreeType ---
+    ft_face = freetype.Face(font_path, index=font_index)
+    ft_face.set_char_size(int(pt_size * 64), 0, 72, 72)
+
+    # --- HarfBuzz ---
+    font_data = Path(font_path).read_bytes()
+    hb_blob = hb.Blob(font_data)
+    hb_face = hb.Face(hb_blob, font_index)
+    hb_font = hb.Font(hb_face)
+    hb_font.scale = (int(pt_size * 64), int(pt_size * 64))
+
+    # --- Spacing ---
+    space_w = _hb_advance_px(hb_font, " ")
+    space_s = space_w / 2.0
+    space_k = space_w / 3.0
+    text_w  = page_w - 2 * margin
+    line_h  = pt_size * leading
+    hyphen_w = _hb_advance_px(hb_font, "-")
+
+    # --- Hyphenation ---
+    dic = None
+    if hyphen_on:
+        try:
+            dic = pyphen.Pyphen(lang="en_US")
+        except:
+            dic = None
+
+    # --- Knuth-Plass params ---
+    kp_params = Params(tolerance=tolerance, emergency_stretch=pt_size)
+
+    # First pass: calculate height and store layout info
+    paras = _split_paragraphs(text)
+    prepared_paras = []
+    estimated_height = margin * 2 + pt_size
+    
+    for para in paras:
+        items = _build_para_items(hb_font, para, space_w, space_s, space_k, pt_size, dic)
+        if len(items) <= 2:
+            continue
+        
+        spec = LineSpec.uniform(text_w)
+        if justification:
+            try:
+                breaks = break_paragraph(items, spec, kp_params)
+            except ValueError:
+                # simple greedy fallback
+                print("Fallback")
+                breaks = _first_fit(items, text_w, hyphen_w)
+        else:
+            breaks = _first_fit(items, text_w, hyphen_w)
+        
+        prepared_paras.append((items, breaks))
+        num_lines = len(breaks)
+        estimated_height += num_lines * line_h + line_h * 0.5
+    
+    page_h = int(estimated_height + margin)
+
+    # --- Cairo surface ---
+    surface = cairo.ImageSurface(cairo.FORMAT_RGB24, page_w, page_h)
+    cr = cairo.Context(surface)
+    cr.set_source_rgb(*bg)
+    cr.paint()
+    cr.set_source_rgb(*fg)
+
+    # --- Cairo font face via ctypes FT bridge ---
+    raw_cr   = _raw_ptr(cr)
+    ff_ptr   = _libcairo.cairo_ft_font_face_create_for_ft_face(_ft_face_ptr(ft_face), 0)
+    _libcairo.cairo_set_font_face(raw_cr, ff_ptr)
+    _libcairo.cairo_set_font_size(raw_cr, ctypes.c_double(pt_size))
+
+    baseline_y = margin + pt_size
+    for items, breaks in prepared_paras:
+        starts = [-1] + breaks
+        ends   = breaks + [len(items)]
+
+        for seg_start_br, seg_end in zip(starts, ends):
+            seg_start = seg_start_br + 1
+            while seg_start < seg_end and isinstance(items[seg_start], Glue):
+                seg_start += 1
+            if seg_start >= seg_end: continue
+
+            line_ends_hyphen = False
+            line_hyphen_w = 0.0
+            if (seg_end < len(items) and isinstance(items[seg_end], Penalty) and items[seg_end].flagged):
+                line_ends_hyphen = True
+                line_hyphen_w = hyphen_w
+
+            nat = line_hyphen_w
+            stretch = shrink = 0.0
+            for it in items[seg_start:seg_end]:
+                if isinstance(it, Box): nat += it.width
+                elif isinstance(it, Glue):
+                    nat += it.width
+                    stretch += it.stretch
+                    shrink  += it.shrink
+
+            sfall = text_w - nat
+            ratio = 0.0
+            if justification:
+                if sfall > 0 and stretch > 0: ratio = sfall / stretch
+                elif sfall < 0 and shrink > 0: ratio = sfall / shrink
+
+            pen_x  = float(margin)
+            glyphs = []
+            for it in items[seg_start:seg_end]:
+                if isinstance(it, Box):
+                    g = _shape_to_glyphs(hb_font, it.text, pen_x, baseline_y)
+                    glyphs.extend(g)
+                    pen_x += it.width
+                elif isinstance(it, Glue):
+                    w = it.width + ratio * (it.stretch if ratio >= 0 else it.shrink)
+                    pen_x += w
+
+            if line_ends_hyphen:
+                g = _shape_to_glyphs(hb_font, "-", pen_x, baseline_y)
+                glyphs.extend(g)
+
+            if glyphs:
+                arr = (_CairoGlyph * len(glyphs))(*(_CairoGlyph(int(gid), x, y) for gid, x, y in glyphs))
+                _libcairo.cairo_show_glyphs(raw_cr, arr, len(glyphs))
+
+            baseline_y += line_h
+        baseline_y += line_h * 0.5
+
+    _libcairo.cairo_font_face_destroy(ff_ptr)
+
+    img_io = io.BytesIO()
+    surface.write_to_png(img_io)
+    img_io.seek(0)
+    return img_io
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -256,10 +462,9 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--font",      default=DEFAULT_FONT)
-    ap.add_argument("--size",      type=float, default=12.0,  metavar="N")
-    ap.add_argument("--width",     type=int,   default=800,   metavar="N")
-    ap.add_argument("--height",    type=int,   default=1000,  metavar="N")
-    ap.add_argument("--margin",    type=int,   default=72,    metavar="N")
+    ap.add_argument("--size",      type=float, default=24.0,  metavar="N")
+    ap.add_argument("--width",     type=int,   default=600,   metavar="N")
+    ap.add_argument("--margin",    type=int,   default=10,    metavar="N")
     ap.add_argument("--leading",   type=float, default=1.4,   metavar="N")
     ap.add_argument("--tolerance", type=float, default=200.0, metavar="N")
     ap.add_argument("--nohyphen",  action="store_true")
@@ -269,144 +474,26 @@ def main():
 
     pt_size   = args.size
     page_w    = args.width
-    page_h    = args.height
     margin    = args.margin
     leading   = args.leading
     tolerance = args.tolerance
 
     text = Path(args.input).read_text(encoding="utf-8")
 
-    # --- FreeType ---
-    ft_face = freetype.Face(args.font)
-    ft_face.set_char_size(int(pt_size * 64), 0, 72, 72)
+    img_io = render_to_io(
+        text=text,
+        font_path=args.font,
+        pt_size=pt_size,
+        page_w=page_w,
+        margin=margin,
+        leading=leading,
+        tolerance=tolerance,
+        hyphen_on=not args.nohyphen,
+    )
 
-    # --- HarfBuzz (uharfbuzz, no FreeType callbacks; scale matches FT) ---
-    font_data = Path(args.font).read_bytes()
-    hb_blob = hb.Blob(font_data)
-    hb_face = hb.Face(hb_blob)
-    hb_font = hb.Font(hb_face)
-    hb_font.scale = (int(pt_size * 64), int(pt_size * 64))
-
-    # --- Spacing (em-based, CJK-font friendly) ---
-    space_w = _hb_advance_px(hb_font, " ")
-    space_s = space_w / 2.0
-    space_k = space_w / 3.0
-    text_w  = page_w - 2 * margin
-    line_h  = pt_size * leading
-
-    # --- Hyphenation (pyphen has built-in dictionaries) ---
-    dic = None
-    hyphen_on = not args.nohyphen
-    if hyphen_on:
-        dic = pyphen.Pyphen(lang="en_US")
-
-    # --- Knuth-Plass params ---
-    kp_params = Params(tolerance=tolerance, emergency_stretch=pt_size)
-
-    # --- Cairo surface ---
-    surface = cairo.ImageSurface(cairo.FORMAT_RGB24, page_w, page_h)
-    cr = cairo.Context(surface)
-    cr.set_source_rgb(1, 1, 1)
-    cr.paint()
-    cr.set_source_rgb(0, 0, 0)
-
-    # --- Cairo font face via ctypes FT bridge ---
-    raw_cr   = _raw_ptr(cr)
-    ff_ptr   = _libcairo.cairo_ft_font_face_create_for_ft_face(_ft_face_ptr(ft_face), 0)
-    _libcairo.cairo_set_font_face(raw_cr, ff_ptr)
-    _libcairo.cairo_set_font_size(raw_cr, ctypes.c_double(pt_size))
-
-    baseline_y = margin + pt_size
-    paras = _split_paragraphs(text)
-
-    for pi, para in enumerate(paras):
-        items = _build_para_items(
-            hb_font, para, space_w, space_s, space_k, pt_size, dic)
-        if len(items) <= 2:
-            continue
-
-        spec = LineSpec.uniform(text_w)
-        try:
-            breaks = break_paragraph(items, spec, kp_params)
-        except ValueError as e:
-            print(f"Warning: {e} — greedy fallback", file=sys.stderr)
-            breaks, acc = [], 0.0
-            for idx, it in enumerate(items):
-                if isinstance(it, Box):
-                    acc += it.width
-                elif isinstance(it, Glue):
-                    if acc + it.width > text_w and idx > 0:
-                        breaks.append(idx)
-                        acc = 0.0
-                    acc += it.width
-            breaks.append(len(items) - 1)
-
-        starts = [-1] + breaks
-        ends   = breaks + [len(items)]
-
-        for seg_start_br, seg_end in zip(starts, ends):
-            seg_start = seg_start_br + 1
-            while seg_start < seg_end and isinstance(items[seg_start], Glue):
-                seg_start += 1
-            if seg_start >= seg_end:
-                continue
-            if baseline_y > page_h - margin:
-                break
-
-            # Hyphen at line end?
-            line_ends_hyphen = False
-            hyphen_w = 0.0
-            if (seg_end < len(items)
-                    and isinstance(items[seg_end], Penalty)
-                    and items[seg_end].flagged):
-                line_ends_hyphen = True
-                hyphen_w = _hb_advance_px(hb_font, "-")
-
-            # Measure line
-            nat = hyphen_w
-            stretch = shrink = 0.0
-            for it in items[seg_start:seg_end]:
-                if isinstance(it, Box):
-                    nat += it.width
-                elif isinstance(it, Glue):
-                    nat += it.width
-                    stretch += it.stretch
-                    shrink  += it.shrink
-
-            sfall = text_w - nat
-            ratio = 0.0
-            if sfall > 0 and stretch > 0:
-                ratio = sfall / stretch
-            elif sfall < 0 and shrink > 0:
-                ratio = sfall / shrink
-
-            # Collect (glyph_id, x, y) tuples
-            pen_x  = float(margin)
-            glyphs = []
-            for it in items[seg_start:seg_end]:
-                if isinstance(it, Box):
-                    g, pen_x = _shape_to_glyphs(hb_font, it.text, pen_x, baseline_y, ft_face)
-                    glyphs.extend(g)
-                elif isinstance(it, Glue):
-                    w = it.width + ratio * (it.stretch if ratio >= 0 else it.shrink)
-                    pen_x += w
-
-            if line_ends_hyphen:
-                g, pen_x = _shape_to_glyphs(hb_font, "-", pen_x, baseline_y, ft_face)
-                glyphs.extend(g)
-
-            if glyphs:
-                arr = (_CairoGlyph * len(glyphs))(
-                    *(_CairoGlyph(int(gid), x, y) for gid, x, y in glyphs))
-                _libcairo.cairo_show_glyphs(raw_cr, arr, len(glyphs))
-
-            baseline_y += line_h
-
-        baseline_y += line_h * 0.5
-
-    _libcairo.cairo_font_face_destroy(ff_ptr)
-    surface.write_to_png(args.output)
-    print(f"Wrote {args.output}  ({page_w}x{page_h})")
+    with open(args.output, "wb") as f:
+        f.write(img_io.getvalue())
+    print(f"Wrote {args.output}")
 
 
 if __name__ == "__main__":
