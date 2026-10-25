@@ -44,10 +44,12 @@ python3 textrender.py --size 14 --width 800 --height 1000 sample_cjk.txt out.png
 
 ## Branch
 
-Active development branch: `claude/modest-wright-ioer1p`
+Active development branch: `main`
 
 ## Notes for agents
 
 - Do not commit compiled binaries (`linebreak`, `textrender`).
 - The Python and C++ renderers produce visually equivalent output but are not pixel-perfect due to different advance hinting (HarfBuzz unhinted vs FreeType hinted) and different hyphenation backends (pyphen vs libhyphen).
 - `linebreak.py` and `linebreak.h` implement the same Knuth-Plass algorithm; keep them in sync when making algorithmic changes.
+- Rounding must match across the two: use `math.floor(x + 0.5)` in Python (not `round()`, which rounds half to even) to match C++ `std::round`. A badness of exactly 12.5 otherwise lands in different fit classes.
+- `emergency_stretch` is added to the line's stretch only, never to its natural width (TeX §851).

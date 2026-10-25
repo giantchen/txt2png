@@ -15,6 +15,7 @@ Usage:
 """
 
 from __future__ import annotations
+import math
 import sys
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -129,7 +130,7 @@ def _badness(t: float, s: float) -> float:
     if s <= 0:
         return float(INF_BAD)
     r = t / s
-    b = round(100.0 * r ** 3)
+    b = math.floor(100.0 * r ** 3 + 0.5)   # match C++ std::round (half away from zero)
     return min(float(INF_BAD), float(b))
 
 
@@ -480,7 +481,7 @@ def _render(segment: list, ratio: float) -> str:
                 w = item.width + ratio * item.stretch
             else:
                 w = item.width + ratio * item.shrink
-            parts.append(" " * max(1, round(w)))
+            parts.append(" " * max(1, math.floor(w + 0.5)))
         elif isinstance(item, Penalty) and item.flagged:
             parts.append("-")
     return "".join(parts)

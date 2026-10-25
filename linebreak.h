@@ -162,7 +162,7 @@ inline std::vector<ActivePtr> linebreak_pass(
             double    global_min   = AWFUL_BAD;
 
             for (const ActivePtr& a : active) {
-                const double line_w = bw - a->tw + extra_stretch;
+                const double line_w = bw - a->tw;
                 const double line_s = bs - a->ts + extra_stretch;
                 const double line_k = bk - a->tk;
                 const int    lnum   = a->line + 1;
