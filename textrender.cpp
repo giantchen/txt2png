@@ -185,6 +185,9 @@ static std::vector<Item> build_para_items(
     const double autospace   = pt_size * 0.25;
     const double autospace_s = pt_size * 0.05;   // small stretch for autospace
 
+    // Width of the hyphen drawn at the end of a line broken at a hyphen point.
+    const double hyphen_w = hb_advance_px(hb_font, "-");
+
     // Script tracker for autospace detection (unknown / CJK / Latin-digit).
     enum Script { UNKNOWN, CJK, LATIN_DIGIT };
     Script last_script = UNKNOWN;
@@ -247,7 +250,7 @@ static std::vector<Item> build_para_items(
                             static_cast<size_t>(prev_pos),
                             static_cast<size_t>(bp + 1 - prev_pos));
                         items.push_back(Box{hb_advance_px(hb_font, syl), syl});
-                        items.push_back(Penalty{50.0, true});  // flagged = hyphen point
+                        items.push_back(Penalty{50.0, true, hyphen_w});  // flagged = hyphen point
                         prev_pos = bp + 1;
                     }
                     std::string last = word_utf8.substr(static_cast<size_t>(prev_pos));

@@ -68,9 +68,9 @@ static std::string render_segment(
                 : g->width + ratio * g->shrink;
             int sp = std::max(1, static_cast<int>(std::round(w)));
             out.append(static_cast<size_t>(sp), ' ');
-        } else if (auto* pen = std::get_if<Penalty>(&it)) {
-            if (pen->flagged) out += '-';
         }
+        // A Penalty inside a line is a break not taken: draw nothing.  The
+        // hyphen of a line ending at a flagged Penalty is added by the caller.
     }
     if (static_cast<int>(out.size()) < target_w)
         out.append(static_cast<size_t>(target_w - static_cast<int>(out.size())), ' ');
@@ -111,6 +111,9 @@ static std::vector<RenderedLine> post_line_break(
                 nat += g->width; stretch += g->stretch; shrink += g->shrink;
             }
         }
+        if (seg_end < n)
+            if (auto* pen = std::get_if<Penalty>(&items[static_cast<size_t>(seg_end)]))
+                nat += pen->width;  // hyphen width when breaking at a penalty
 
         const double target = spec.width(line_num);
         const double sfall  = target - nat;
@@ -121,7 +124,11 @@ static std::vector<RenderedLine> post_line_break(
             ratio = sfall / stretch;
             bad   = badness(sfall, stretch);
             fit   = (bad > 99.0) ? "very loose" : (bad > 12.0) ? "loose" : "decent";
-        } else if (sfall < 0.0 && shrink > 0.0) {
+        } else if (sfall < 0.0 && -sfall > shrink) {
+            ratio = -1.0;  // shrink all it can; the rest sticks out
+            bad   = INF_BAD + 1.0;
+            fit   = "overfull";
+        } else if (sfall < 0.0) {
             ratio = sfall / shrink;
             bad   = badness(-sfall, shrink);
             fit   = "tight";

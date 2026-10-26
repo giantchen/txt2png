@@ -167,6 +167,7 @@ def _build_para_items(hb_font, para: str, space_w: float, space_s: float,
     cjk_stretch = space_w * 0.5
     autospace   = pt_size * 0.25
     autospace_s = pt_size * 0.05
+    hyphen_w    = _hb_advance_px(hb_font, "-")
 
     UNKNOWN, CJK, LATIN_DIGIT = 0, 1, 2
     last_script = UNKNOWN
@@ -204,7 +205,7 @@ def _build_para_items(hb_font, para: str, space_w: float, space_s: float,
                     for bp in hbreaks:
                         syl = word[prev:bp + 1]
                         items.append(Box(_hb_advance_px(hb_font, syl), syl))
-                        items.append(Penalty(50.0, True))
+                        items.append(Penalty(50.0, True, hyphen_w))
                         prev = bp + 1
                     last_syl = word[prev:]
                     items.append(Box(_hb_advance_px(hb_font, last_syl), last_syl))

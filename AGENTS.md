@@ -53,3 +53,4 @@ Active development branch: `main`
 - `linebreak.py` and `linebreak.h` implement the same Knuth-Plass algorithm; keep them in sync when making algorithmic changes.
 - Rounding must match across the two: use `math.floor(x + 0.5)` in Python (not `round()`, which rounds half to even) to match C++ `std::round`. A badness of exactly 12.5 otherwise lands in different fit classes.
 - `emergency_stretch` is added to the line's stretch only, never to its natural width (TeX §851).
+- A flagged (hyphen) `Penalty` carries the hyphen's width in `width`; the breaker adds it to a line only when the line ends there.

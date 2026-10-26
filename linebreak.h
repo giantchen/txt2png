@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <stdexcept>
@@ -18,7 +19,7 @@
 
 static constexpr double INF_PENALTY = 10'000.0;
 static constexpr double INF_BAD     = 10'000.0;
-static constexpr double AWFUL_BAD   = 10'000'000.0;
+static constexpr double AWFUL_BAD   = std::numeric_limits<double>::infinity();  // demerits sentinel
 
 enum FitClass { VERY_LOOSE = 0, LOOSE = 1, DECENT = 2, TIGHT = 3 };
 
@@ -40,6 +41,7 @@ struct Glue {
 struct Penalty {
     double value;
     bool   flagged = false;
+    double width   = 0.0;   // added to the line only if it breaks here (hyphen)
 };
 
 using Item = std::variant<Box, Glue, Penalty>;
@@ -84,6 +86,8 @@ struct Active {
     int    fit;
     bool   flagged;
     double demerits;
+    // cumulative widths where the next line starts: everything up to and
+    // including the break item and the discardable items after it (§837)
     double tw, ts, tk;
     int    serial = 0;          // tracing: serial number (@@N in TeX output)
     std::shared_ptr<Active> prev;
@@ -96,6 +100,7 @@ using ActivePtr = std::shared_ptr<Active>;
 // ---------------------------------------------------------------------------
 
 inline double badness(double t, double s) {
+    // The caller handles a line shrunk beyond its shrink (§851).
     if (t == 0.0) return 0.0;
     if (s <= 0.0) return INF_BAD;
     double r = t / s;
@@ -104,6 +109,10 @@ inline double badness(double t, double s) {
 
 // ---------------------------------------------------------------------------
 // Single pass of the Knuth-Plass algorithm.
+//
+// final_pass: never lose the last active node, so a paragraph can always be
+// set (with overfull or underfull lines if needed).  Returns the nodes that
+// end the paragraph, or none if this pass failed.
 //
 // trace_out: if non-null, emit \tracingparagraphs-style diagnostics.
 // ---------------------------------------------------------------------------
@@ -114,6 +123,7 @@ inline std::vector<ActivePtr> linebreak_pass(
     const Params&             params,
     double                    tolerance,
     double                    extra_stretch,
+    bool                      final_pass,
     std::ostream*             trace_out = nullptr)
 {
     // seed node: serial 0 (@@0 = paragraph start)
@@ -147,8 +157,25 @@ inline std::vector<ActivePtr> linebreak_pass(
         }
 
         if (is_break) {
+            // A line ending HERE has the cumulative totals cum_* (the break
+            // item has not been added yet), plus the penalty width for a
+            // hyphen.  Compute break_width (§837): the break item and the
+            // glue/penalties after it, up to the next box, are discarded, so
+            // the next line starts after them.  They are added to cum_* as
+            // the scan goes on, so the new node's totals must include them.
             const double bw = cum_w, bs = cum_s, bk = cum_k;
+            double aw = cum_w, as = cum_s, ak = cum_k;
+            for (int j = i; j < n && !std::holds_alternative<Box>(items[static_cast<size_t>(j)]); ++j) {
+                if (auto* g = std::get_if<Glue>(&items[static_cast<size_t>(j)])) {
+                    aw += g->width;
+                    as += g->stretch;
+                    ak += g->shrink;
+                }
+            }
+            const auto*  pen_item = std::get_if<Penalty>(&item);
+            const double pen_w    = pen_item ? pen_item->width : 0.0;
             if (pi <= -INF_PENALTY) pi = -INF_PENALTY;
+            const bool forced = (pi == -INF_PENALTY);
 
             const char* itype = std::holds_alternative<Glue>(item)
                 ? "\\glue" : "\\penalty";
@@ -161,8 +188,9 @@ inline std::vector<ActivePtr> linebreak_pass(
             int       best_line[4] = {};
             double    global_min   = AWFUL_BAD;
 
-            for (const ActivePtr& a : active) {
-                const double line_w = bw - a->tw;
+            for (size_t idx = 0; idx < active.size(); ++idx) {
+                const ActivePtr& a = active[idx];
+                const double line_w = bw - a->tw + pen_w;
                 const double line_s = bs - a->ts + extra_stretch;
                 const double line_k = bk - a->tk;
                 const int    lnum   = a->line + 1;
@@ -175,21 +203,38 @@ inline std::vector<ActivePtr> linebreak_pass(
                     b  = badness(sfall, line_s);
                     fc = (b > 99.0) ? VERY_LOOSE : (b > 12.0) ? LOOSE : DECENT;
                 } else if (sfall < 0.0) {
-                    b  = badness(-sfall, line_k);
+                    if (-sfall > line_k)
+                        b = INF_BAD + 1.0;  // cannot shrink enough (§851)
+                    else
+                        b = badness(-sfall, line_k);
                     fc = (b > 12.0) ? TIGHT : DECENT;
                 }
 
-                const bool overfull = (sfall < 0.0);
-                if (overfull && b > tolerance && pi != -INF_PENALTY)
-                    continue;  // deactivated — don't trace
-
-                survivors.push_back(a);
-
-                if (b > tolerance && !overfull && pi != -INF_PENALTY)
-                    continue;  // underfull skip — still trace the candidate
+                // Deactivation rule (§851, §854 in tex.p):
+                // - b > INF_BAD (overfull beyond shrink): future items only
+                //   add width, so deactivate the node.
+                // - Forced break: no line may span it, so deactivate every node.
+                // - Otherwise keep the node active, even if b > tolerance,
+                //   since future items may fill the line.
+                // A deactivated node may still end a line here if b <= tolerance.
+                // On the final pass, the last remaining node is never lost: it
+                // breaks here anyway with artificial demerits 0 (an overfull or
+                // underfull line), so a paragraph can always be set.
+                bool artificial = false;
+                if (b > INF_BAD || forced) {
+                    if (final_pass && global_min == AWFUL_BAD && survivors.empty()
+                            && idx == active.size() - 1)
+                        artificial = true;
+                    else if (b > tolerance)
+                        continue;  // deactivated — don't trace
+                } else {
+                    survivors.push_back(a);
+                    if (b > tolerance)
+                        continue;  // too bad to break here, but stays active
+                }
 
                 double d = 0.0;
-                if (pi != -INF_PENALTY && b < INF_BAD) {
+                if (!artificial) {
                     d = (params.line_penalty + b) * (params.line_penalty + b);
                     if (pi > 0.0)               d += pi * pi;
                     else if (pi > -INF_PENALTY)  d -= pi * pi;
@@ -205,7 +250,7 @@ inline std::vector<ActivePtr> linebreak_pass(
                                << " b=" << static_cast<long long>(b)
                                << " p=" << static_cast<long long>(pi)
                                << " d=";
-                    if (pi <= -INF_PENALTY || b >= INF_BAD)
+                    if (artificial)
                         *trace_out << "*";
                     else
                         *trace_out << static_cast<long long>(d - a->demerits);
@@ -220,12 +265,14 @@ inline std::vector<ActivePtr> linebreak_pass(
                 }
             }
 
+            // NOTE: TeX also groups nodes by line number (§835) so that
+            // varying LineSpec widths work; here all line numbers share min_dem.
             if (global_min < AWFUL_BAD) {
                 for (int fc = 0; fc < 4; ++fc) {
                     if (min_dem[fc] <= global_min + params.adj_demerits) {
                         auto node = std::make_shared<Active>(Active{
                             i, best_line[fc], fc, is_flag,
-                            min_dem[fc], bw, bs, bk,
+                            min_dem[fc], aw, as, ak,
                             serial_ctr,
                             best_prev[fc]
                         });
@@ -265,7 +312,6 @@ inline std::vector<ActivePtr> linebreak_pass(
     std::vector<ActivePtr> finals;
     for (const ActivePtr& a : active)
         if (a->pos == final_pos) finals.push_back(a);
-    if (finals.empty()) finals = active;
     return finals;
 }
 
@@ -293,16 +339,22 @@ inline std::vector<int> break_paragraph(
     const Params&             params    = {},
     std::ostream*             trace_out = nullptr)
 {
-    static const char* pass_names[3] = {
-        "@firstpass", "@secondpass", "@thirdpass"
-    };
-    const double tols[3]   = {params.pre_tolerance, params.tolerance, params.tolerance};
-    const double extras[3] = {0.0, 0.0, params.emergency_stretch};
+    // Passes mirror TeX §828 and §863: the first pass is skipped if
+    // pre_tolerance < 0, and the second is final if emergency_stretch <= 0.
+    struct Pass { const char* name; double tolerance, extra; bool final_pass; };
+    std::vector<Pass> passes;
+    if (params.pre_tolerance >= 0.0)
+        passes.push_back({"@firstpass", params.pre_tolerance, 0.0, false});
+    passes.push_back({"@secondpass", params.tolerance, 0.0,
+                      params.emergency_stretch <= 0.0});
+    if (params.emergency_stretch > 0.0)
+        passes.push_back({"@emergencypass", params.tolerance,
+                          params.emergency_stretch, true});
 
-    for (int pass = 0; pass < 3; ++pass) {
-        if (trace_out) *trace_out << pass_names[pass] << "\n";
-        auto finals = linebreak_pass(items, spec, params,
-                                     tols[pass], extras[pass], trace_out);
+    for (const Pass& pass : passes) {
+        if (trace_out) *trace_out << pass.name << "\n";
+        auto finals = linebreak_pass(items, spec, params, pass.tolerance,
+                                     pass.extra, pass.final_pass, trace_out);
         if (!finals.empty()) {
             auto best = *std::min_element(finals.begin(), finals.end(),
                 [](const ActivePtr& a, const ActivePtr& b) {
@@ -315,7 +367,8 @@ inline std::vector<int> break_paragraph(
         }
     }
 
+    // The final pass always sets the paragraph, unless items do not end
+    // with a forced break.
     throw std::runtime_error(
-        "Cannot break paragraph: no feasible solution. "
-        "Try increasing tolerance or emergency_stretch.");
+        "Cannot break paragraph: items must end with a forced break.");
 }

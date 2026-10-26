@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple
 # ---------------------------------------------------------------------------
 INF_PENALTY = 10_000        # forbidden / forced break threshold (TeX: 10000)
 INF_BAD     = 10_000        # maximum badness
-AWFUL_BAD   = 10_000_000    # demerits sentinel (effectively infinite)
+AWFUL_BAD   = float("inf")  # demerits sentinel
 
 VERY_LOOSE = 0
 LOOSE      = 1
@@ -61,6 +61,7 @@ class Penalty:
     """
     value: float
     flagged: bool = False    # True = hyphen-like (affects double-hyphen demerits)
+    width: float = 0.0       # added to the line only if it breaks here (hyphen)
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +113,8 @@ class _Active:
     fit:       int    # fit class (VERY_LOOSE..TIGHT) of this break's line
     flagged:   bool   # was this break flagged (hyphen)?
     demerits:  float  # total accumulated demerits
-    # cumulative widths *at* this break point (sum of everything on this line
-    # and all previous lines up to, but not including, the break glue)
+    # cumulative widths where the next line starts: everything up to and
+    # including the break item and the discardable items after it (§837)
     tw: float = 0.0   # total natural width
     ts: float = 0.0   # total stretch
     tk: float = 0.0   # total shrink
@@ -125,6 +126,7 @@ class _Active:
 # ---------------------------------------------------------------------------
 
 def _badness(t: float, s: float) -> float:
+    # The caller handles a line shrunk beyond its shrink (§851).
     if t == 0:
         return 0.0
     if s <= 0:
@@ -143,20 +145,30 @@ def _try_break(
     pos: int,
     pi: float,
     is_flag: bool,
+    pen_w: float,
     bw: float,
     bs: float,
     bk: float,
+    aw: float,
+    as_: float,
+    ak: float,
     spec: LineSpec,
     params: Params,
     tolerance: float,
     extra_stretch: float,
+    final_pass: bool,
 ) -> List[_Active]:
     """
     For each active node, consider breaking at the current position (pos).
     Mirrors procedure trybreak in tex.p §829.
+
+    bw/bs/bk are the cumulative totals before the break item, pen_w is the
+    width of a penalty (hyphen) added to a line ending here, and aw/as_/ak
+    are the totals where the next line starts.
     """
     if pi <= -INF_PENALTY:
         pi = float(-INF_PENALTY)    # clamp forced break
+    forced = (pi == -INF_PENALTY)
 
     new_active: List[_Active] = []
     survivors:  List[_Active] = []
@@ -166,9 +178,9 @@ def _try_break(
     best_line  = [0] * 4
     global_min = AWFUL_BAD
 
-    for a in active:
+    for idx, a in enumerate(active):
         # Width of candidate line from a.pos to here
-        line_w = bw - a.tw
+        line_w = bw - a.tw + pen_w
         line_s = bs - a.ts + extra_stretch
         line_k = bk - a.tk
 
@@ -183,30 +195,40 @@ def _try_break(
             elif b > 12: fc = LOOSE
             else:        fc = DECENT
         elif shortfall < 0:
-            b  = _badness(-shortfall, line_k)
+            if -shortfall > line_k:
+                b = float(INF_BAD + 1)    # cannot shrink enough (§851)
+            else:
+                b = _badness(-shortfall, line_k)
             fc = TIGHT if b > 12 else DECENT
         else:
             b  = 0.0
             fc = DECENT
 
-        # Deactivation rule (§854 in tex.p):
-        # - Overfull lines (shortfall < 0, line already too long):
-        #   deactivate if b > tolerance — future items only add width.
-        # - Underfull lines (shortfall >= 0): KEEP the node active
-        #   even if b > tolerance — future items may fill the line.
-        # - Forced break (pi = -INF_PENALTY): never deactivate.
-        overfull = (shortfall < 0)
-        if overfull and b > tolerance and pi != -INF_PENALTY:
-            continue   # line already too long; discard this node
-        survivors.append(a)
-
-        # Skip recording this as a break if underfull and too bad
-        if b > tolerance and not overfull and pi != -INF_PENALTY:
-            continue
+        # Deactivation rule (§851, §854 in tex.p):
+        # - b > INF_BAD (overfull beyond shrink): future items only add
+        #   width, so deactivate the node.
+        # - Forced break: no line may span it, so deactivate every node.
+        # - Otherwise keep the node active, even if b > tolerance, since
+        #   future items may fill the line.
+        # A deactivated node may still end a line here if b <= tolerance.
+        # On the final pass, the last remaining node is never lost: it breaks
+        # here anyway with artificial demerits 0 (an overfull or underfull
+        # line), so a paragraph can always be set.
+        artificial = False
+        if b > INF_BAD or forced:
+            if (final_pass and global_min == AWFUL_BAD and not survivors
+                    and idx == len(active) - 1):
+                artificial = True
+            elif b > tolerance:
+                continue    # deactivate
+        else:
+            survivors.append(a)
+            if b > tolerance:
+                continue    # too bad to break here, but stays active
 
         # Demerits (§855, §859)
-        if pi == -INF_PENALTY or b >= INF_BAD:
-            d = 0.0    # artificial: forced or desperate break
+        if artificial:
+            d = 0.0
         else:
             d = (params.line_penalty + b) ** 2
             if pi > 0:
@@ -227,6 +249,8 @@ def _try_break(
             if d < global_min:
                 global_min = d
 
+    # NOTE: TeX also groups nodes by line number (§835) so that varying
+    # LineSpec widths work; here all line numbers share min_dem.
     # Create new active nodes for the best break in each fit class (§845)
     if global_min < AWFUL_BAD:
         for fc in range(4):
@@ -237,9 +261,9 @@ def _try_break(
                     fit      = fc,
                     flagged  = is_flag,
                     demerits = min_dem[fc],
-                    tw = bw,
-                    ts = bs,
-                    tk = bk,
+                    tw = aw,
+                    ts = as_,
+                    tk = ak,
                     prev = best_prev[fc],
                 )
                 new_active.append(node)
@@ -253,6 +277,7 @@ def _linebreak(
     params: Params,
     tolerance: float,
     extra_stretch: float = 0.0,
+    final_pass: bool = False,
 ) -> Optional[List[_Active]]:
     """
     Single pass of the Knuth-Plass algorithm with given tolerance.
@@ -297,16 +322,26 @@ def _linebreak(
                 is_flag  = item.flagged
 
         # -----------------------------------------------------------------
-        # Compute break_width: cumulative totals for a line ending HERE.
-        # If we break at a glue, that glue is discarded (not on either line).
-        # The glue has NOT been added to cum_w yet at this point, so
-        # break_width = cum_w (the glue simply won't be counted).
-        # For a penalty break, the penalty itself has no width.
+        # A line ending HERE has the cumulative totals cum_* (the break item
+        # has not been added yet), plus the penalty width for a hyphen.
+        # Compute break_width (§837): the break item and the glue/penalties
+        # after it, up to the next box, are discarded, so the next line
+        # starts after them.  They are added to cum_* as the scan goes on,
+        # so the new node's totals must include them.
         # -----------------------------------------------------------------
         if is_break:
+            aw, as_, ak = cum_w, cum_s, cum_k
+            j = i
+            while j < len(items) and not isinstance(items[j], Box):
+                if isinstance(items[j], Glue):
+                    aw  += items[j].width
+                    as_ += items[j].stretch
+                    ak  += items[j].shrink
+                j += 1
+            pen_w = item.width if isinstance(item, Penalty) else 0.0
             active = _try_break(
-                active, i, pi, is_flag, cum_w, cum_s, cum_k,
-                spec, params, tolerance, extra_stretch
+                active, i, pi, is_flag, pen_w, cum_w, cum_s, cum_k,
+                aw, as_, ak, spec, params, tolerance, extra_stretch, final_pass
             )
 
         # -----------------------------------------------------------------
@@ -325,25 +360,15 @@ def _linebreak(
     # text_to_items() terminates with Glue(INF stretch) + Penalty(-INF).
     # The try_break for Penalty(-INF) creates active nodes whose position
     # is that final penalty index — these represent complete paragraphs.
-    # We also accept nodes created during earlier forced-break processing.
     # All nodes in `active` whose `pos` equals the final item index are
     # end-of-paragraph nodes; pick the one with minimum total demerits.
-    # For safety also run one more forced-break scan over the whole list.
+    # If there are none, this pass failed (never on the final pass).
     # ---------------------------------------------------------------------
     final_penalty_pos = len(items) - 1   # index of the Penalty(-INF) item
 
     # Nodes created at the final penalty position are complete paragraphs.
     final_nodes = [a for a in active if a.pos == final_penalty_pos]
-
-    # Fallback: if none were created at that exact position (e.g. items list
-    # doesn't end with our terminator), pick any active node — last resort.
-    if not final_nodes:
-        final_nodes = active
-
-    if not final_nodes:
-        return None
-
-    return final_nodes
+    return final_nodes or None
 
 
 def _traceback(final_node: _Active) -> List[int]:
@@ -375,30 +400,31 @@ def break_paragraph(
     a flagged Penalty represents a hyphen).
 
     Tries up to three passes (pre_tolerance → tolerance → emergency_stretch),
-    mirroring TeX §828.
+    mirroring TeX §828 and §863: the first pass is skipped if pre_tolerance
+    < 0, and the second is final if emergency_stretch <= 0.  The final pass
+    always sets the paragraph, with overfull or underfull lines if needed.
 
-    Raises ValueError if no feasible break sequence exists.
+    Raises ValueError only if items do not end with a forced break.
     """
     if params is None:
         params = Params()
 
-    passes = [
-        (params.pre_tolerance, 0.0),
-        (params.tolerance,     0.0),
-        (params.tolerance,     params.emergency_stretch),
-    ]
+    passes = []
+    if params.pre_tolerance >= 0:
+        passes.append((params.pre_tolerance, 0.0, False))
+    passes.append((params.tolerance, 0.0, params.emergency_stretch <= 0))
+    if params.emergency_stretch > 0:
+        passes.append((params.tolerance, params.emergency_stretch, True))
 
-    for tolerance, extra in passes:
-        result = _linebreak(items, spec, params, tolerance, extra)
+    for tolerance, extra, final_pass in passes:
+        result = _linebreak(items, spec, params, tolerance, extra, final_pass)
         if result:
-            print(f'tolerance {tolerance} emergency_stretch {extra} got {len(result)}.')
             # Pick the node with lowest total demerits
             best = min(result, key=lambda n: n.demerits)
             return _traceback(best)
 
     raise ValueError(
-        "Cannot break paragraph into lines within the given constraints. "
-        "Try increasing tolerance or emergency_stretch."
+        "Cannot break paragraph: items must end with a forced break."
     )
 
 
@@ -439,6 +465,8 @@ def post_line_break(
         nat     = sum(i.width   if isinstance(i, (Box, Glue)) else 0 for i in segment)
         stretch = sum(i.stretch if isinstance(i, Glue)        else 0 for i in segment)
         shrink  = sum(i.shrink  if isinstance(i, Glue)        else 0 for i in segment)
+        if end < len(items) and isinstance(items[end], Penalty):
+            nat += items[end].width    # hyphen width when breaking at a penalty
 
         target    = spec.width(line_num)
         shortfall = target - nat
@@ -447,7 +475,11 @@ def post_line_break(
             ratio   = shortfall / stretch
             badness = _badness(shortfall, stretch)
             fit     = "very loose" if badness > 99 else ("loose" if badness > 12 else "decent")
-        elif shortfall < 0 and shrink > 0:
+        elif shortfall < 0 and -shortfall > shrink:
+            ratio   = -1.0     # shrink all it can; the rest sticks out
+            badness = float(INF_BAD + 1)
+            fit     = "overfull"
+        elif shortfall < 0:
             ratio   = shortfall / shrink   # negative
             badness = _badness(-shortfall, shrink)
             fit     = "tight"
@@ -482,8 +514,8 @@ def _render(segment: list, ratio: float) -> str:
             else:
                 w = item.width + ratio * item.shrink
             parts.append(" " * max(1, math.floor(w + 0.5)))
-        elif isinstance(item, Penalty) and item.flagged:
-            parts.append("-")
+        # A Penalty inside a line is a break not taken: draw nothing.  The
+        # hyphen of a line ending at a flagged Penalty is added by the caller.
     return "".join(parts)
 
 
