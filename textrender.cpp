@@ -111,6 +111,15 @@ static bool is_latin_or_digit(char32_t cp) {
         || (cp >= 0x00C0 && cp <= 0x024F);  // extended Latin
 }
 
+// Returns true for characters that ICU UAX #14 treats as individually
+// breakable CJK: is_cjk plus radicals and fullwidth forms ('，', etc.).
+static bool is_cjk_segmentation(char32_t cp) {
+    return is_cjk(cp)
+        || (cp >= 0x2E80 && cp <= 0x2FFF)    // CJK radicals, Kangxi
+        || (cp >= 0xFF01 && cp <= 0xFF60)    // fullwidth ASCII/punct
+        || (cp >= 0xFFE0 && cp <= 0xFFE6);
+}
+
 // Decode first Unicode codepoint from a UTF-8 string. Returns 0 on error.
 static char32_t first_codepoint(const std::string& s) {
     if (s.empty()) return 0;
@@ -270,9 +279,13 @@ static std::vector<Item> build_para_items(
                 int rule = bi->getRuleStatus();
                 if (rule >= UBRK_LINE_HARD) {
                     items.push_back(Penalty{-INF_PENALTY, false});
-                } else {
+                } else if (is_cjk_segmentation(cp)) {
                     // Optional break: micro-glue so Knuth-Plass can justify CJK
                     items.push_back(Glue{0.0, cjk_stretch, 0.0});
+                } else {
+                    // Break after a non-CJK segment such as "line-" or "a/":
+                    // allowed, but with no stretch (TeX \exhyphenpenalty).
+                    items.push_back(Penalty{50.0, false});
                 }
             }
         }
@@ -280,9 +293,15 @@ static std::vector<Item> build_para_items(
         prev = pos;
     }
 
-    // Remove trailing Glue left by last segment (will be replaced by parfillskip)
-    while (!items.empty() && std::holds_alternative<Glue>(items.back()))
+    // Remove trailing Glue or optional Penalty left by last segment (will be
+    // replaced by parfillskip)
+    while (!items.empty()) {
+        auto* pen = std::get_if<Penalty>(&items.back());
+        if (!std::holds_alternative<Glue>(items.back())
+                && !(pen && pen->value > -INF_PENALTY))
+            break;
         items.pop_back();
+    }
 
     items.push_back(Glue{0.0, INF_PENALTY, 0.0});   // parfillskip
     items.push_back(Penalty{-INF_PENALTY, false});   // forced end

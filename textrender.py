@@ -220,9 +220,15 @@ def _build_para_items(hb_font, para: str, space_w: float, space_s: float,
             items.append(Box(w, word))
             if _is_cjk_segmentation(cp):
                 items.append(Glue(0.0, cjk_stretch, 0.0))
+            else:
+                # Break after a non-CJK segment such as "line-" or "a/":
+                # allowed, but with no stretch (TeX \exhyphenpenalty).
+                items.append(Penalty(50.0))
 
-    # Strip trailing Glue; add paragraph terminator (parfillskip + forced break).
-    while items and isinstance(items[-1], Glue):
+    # Strip trailing Glue or optional Penalty; add paragraph terminator
+    # (parfillskip + forced break).
+    while items and (isinstance(items[-1], Glue) or
+                     (isinstance(items[-1], Penalty) and items[-1].value > -INF_PENALTY)):
         items.pop()
     items.append(Glue(0.0, float(INF_PENALTY), 0.0))
     items.append(Penalty(float(-INF_PENALTY)))
