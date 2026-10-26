@@ -528,7 +528,8 @@ int main(int argc, char* argv[]) {
             double ratio = 0.0;
             double sfall = text_w - nat;
             if (sfall > 0.0 && stretch > 0.0)        ratio =  sfall / stretch;
-            else if (sfall < 0.0 && shrink  > 0.0)   ratio =  sfall / shrink;
+            // An overfull line shrinks all it can; the rest sticks out.
+            else if (sfall < 0.0 && shrink  > 0.0)   ratio =  std::max(-1.0, sfall / shrink);
 
             // Emit glyphs
             double pen_x = margin;

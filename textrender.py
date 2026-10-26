@@ -428,7 +428,8 @@ def render_to_io(text, font_path, pt_size, page_w, margin=10, leading=1.4, toler
             ratio = 0.0
             if justification:
                 if sfall > 0 and stretch > 0: ratio = sfall / stretch
-                elif sfall < 0 and shrink > 0: ratio = sfall / shrink
+                # An overfull line shrinks all it can; the rest sticks out.
+                elif sfall < 0 and shrink > 0: ratio = max(-1.0, sfall / shrink)
 
             pen_x  = float(margin)
             glyphs = []
